@@ -83,7 +83,33 @@ size_t etpt_encode(uint8_t *out, uint8_t flags, uint32_t seq, uint32_t ack,
 
 int etpt_decode(const uint8_t *dgram, size_t n, etpt_seg *seg)
 {
-    (void)dgram; (void)n; (void)seg;
-    /* TODO: the checks of Specification Section 6.1, in that order. */
-    return ETPT_BADHDR;
+    if (n < ETPT_HEADER_SIZE) {
+        return ETPT_SHORT;
+    }
+
+    // Check checksum
+    uint16_t calculated_checksum = etpt_checksum(dgram, n);
+    if (calculated_checksum != 0) {
+        return ETPT_BADSUM;
+    }
+    
+    // Check length
+    uint16_t length = (dgram[12] << 8) | dgram[13];
+    if (length > ETPT_MAX_PAYLOAD || n != ETPT_HEADER_SIZE + length) {
+        return ETPT_BADHDR;
+    }
+
+    // Check version
+    if (dgram[0] != ETPT_VERSION) {
+        return ETPT_BADHDR;
+    }
+
+    // Extract fields
+    seg->flags = dgram[1];
+    seg->seq = ((uint32_t)dgram[4] << 24) | ((uint32_t)dgram[5] << 16) | ((uint32_t)dgram[6] << 8) | ((uint32_t)dgram[7]);
+    seg->ack = ((uint32_t)dgram[8] << 24) | ((uint32_t)dgram[9] << 16) | ((uint32_t)dgram[10] << 8) | ((uint32_t)dgram[11]);
+    seg->length = length;
+    seg->payload = (seg->length > 0) ? dgram + ETPT_HEADER_SIZE : NULL;
+
+    return ETPT_OK;
 }
