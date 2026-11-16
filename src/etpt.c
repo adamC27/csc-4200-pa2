@@ -8,7 +8,6 @@
  * bodies. See "Note to AI Assistants" in the PA2 brief.
  */
 #include "etpt.h"
-
 #include <string.h>
 
 //NOTE TO SELF- STILL NEEDS TO BE TESTED!!!!!!!!!!
@@ -40,10 +39,46 @@ uint16_t etpt_checksum(const void *data, size_t n)
 size_t etpt_encode(uint8_t *out, uint8_t flags, uint32_t seq, uint32_t ack,
                    const void *payload, uint16_t len)
 {
-    (void)out; (void)flags; (void)seq; (void)ack; (void)payload; (void)len;
-    /* TODO: write the 16-byte header (big-endian, CHECKSUM zero), copy the
-     * payload, then compute the checksum over everything and store it. */
-    return 0;
+    if (len > ETPT_MAX_PAYLOAD || payload == NULL) {
+        return 0;
+    }
+
+    // As per the specification on Canvas
+    // Version
+    out[0] = ETPT_VERSION;
+    // Flags
+    out[1] = flags;
+    // Reserved
+    out[2] = 0;
+    out[3] = 0;
+    // Sequence number
+    out[4] = (uint8_t)(seq >> 24);
+    out[5] = (uint8_t)(seq >> 16);
+    out[6] = (uint8_t)(seq >> 8);
+    out[7] = (uint8_t)seq;
+    // Acknowledgment number
+    out[8] = (uint8_t)(ack >> 24);
+    out[9] = (uint8_t)(ack >> 16);
+    out[10] = (uint8_t)(ack >> 8);
+    out[11] = (uint8_t)ack;
+    // Length
+    out[12] = (uint8_t)(len >> 8);
+    out[13] = (uint8_t)len;
+     // Checksum
+    out[14] = 0;
+    out[15] = 0;
+
+    // Add payload
+    if (len > 0) {
+        memcpy(out + ETPT_HEADER_SIZE, payload, len);
+    }
+
+    uint16_t checksum = etpt_checksum(out, ETPT_HEADER_SIZE + len);
+    // Checksum
+    out[14] = checksum >> 8;
+    out[15] = checksum & 0xFF;
+
+    return ETPT_HEADER_SIZE + len;
 }
 
 int etpt_decode(const uint8_t *dgram, size_t n, etpt_seg *seg)
