@@ -139,9 +139,9 @@ struct tp_conn
     uint32_t receive_next;
     int window;
     double retransmission_timeout;
-    /* TODO: sending state (base, next, unacknowledged segments and their
-     * send times, the timer, SRTT/RTTVAR/RTO, retries) and receiving state
-     * (next expected, delivered bytes not yet read, peer FIN). */
+    double smoothed_rtt;
+    double rtt_variation;
+    int has_rtt_sample;
 };
 
 void tp_set_window(int w)
@@ -258,10 +258,153 @@ tp_conn *tp_accept(tp_listener *l, char *peer, size_t peerlen)
 
 tp_conn *tp_connect(const char *host, uint16_t port)
 {
-    (void)host;
-    (void)port;
-    /* TODO */
-    return NULL;
+    if (host == NULL)
+        return NULL;
+
+    // find the remote address and port
+    struct sockaddr_in peer;
+    if (udp_resolve(host, port, &peer) != 0)
+        return NULL;
+
+    // Create a local UDP socket
+    int fd = udp_open(NULL, 0);
+    if (fd < 0)
+        return NULL;
+
+    tp_conn *c = calloc(1, sizeof *c);
+    if (c == NULL)
+    {
+        close(fd);
+        return NULL;
+    }
+
+    c->fd = fd;
+    c->peer = peer;
+    c->owns_fd = 1;
+    c->send_base = 0;
+    // The SYN segment consumes sequence number 0 so the next number is 1.
+    c->send_next = 1;
+    c->receive_next = 1;
+    c->window = g_window;
+    c->retransmission_timeout = ETPT_INIT_RTO;
+    c->st.rto_ms = ETPT_INIT_RTO * 1000.0;
+
+    uint8_t packet[ETPT_HEADER_SIZE + ETPT_MAX_PAYLOAD];
+    size_t packet_len = etpt_encode(packet, ETPT_SYN, 0, 0, NULL, 0);
+    if (packet_len == 0)
+    {
+        tp_free_conn(c);
+        return NULL;
+    }
+
+    udp_send(c->fd, &c->peer, packet, packet_len);
+    c->st.segments_sent++;
+
+    double first_sent_at = now_s();
+    double deadline = first_sent_at + c->retransmission_timeout;
+    unsigned int retries = 0;
+
+    // Wait for an ACK for the SYN segment
+    while (1)
+    {
+        double now = now_s();
+
+        if (now >= deadline)
+        {
+            c->st.timeouts++;
+
+            // give up if we have retried too many times
+            if (retries >= ETPT_MAX_RETRIES)
+            {
+                tp_free_conn(c);
+                return NULL;
+            }
+
+            c->retransmission_timeout *= 2.0;
+            if (c->retransmission_timeout > ETPT_MAX_RTO)
+                c->retransmission_timeout = ETPT_MAX_RTO;
+            c->st.rto_ms = c->retransmission_timeout * 1000.0;
+
+            // Re-encode and retransmit the SYN.
+            packet_len = etpt_encode(packet, ETPT_SYN, 0, 0, NULL, 0);
+            if (packet_len == 0)
+            {
+                tp_free_conn(c);
+                return NULL;
+            }
+
+            udp_send(c->fd, &c->peer, packet, packet_len);
+            c->st.segments_sent++;
+            c->st.retransmissions++;
+            retries++;
+
+            deadline = now_s() + c->retransmission_timeout;
+            continue;
+        }
+
+        // Wait for an ACK until the deadline
+        struct sockaddr_in from;
+        double wait = deadline - now;
+        ssize_t n = udp_recv(c->fd, packet, sizeof packet, wait, &from);
+
+        // error
+        if (n < 0)
+        {
+            tp_free_conn(c);
+            return NULL;
+        }
+        // Timeout or interruption
+        if (n == 0)
+            continue;
+
+        // check the segment for validity and checksum
+        etpt_seg segment;
+        int result = etpt_decode(packet, (size_t)n, &segment);
+
+        if (result == ETPT_BADSUM)
+        {
+            c->st.checksum_failures++;
+            continue;
+        }
+        else if (result != ETPT_OK)
+        {
+            c->st.invalid++;
+            continue;
+        }
+
+        // Ignore packets from any other endpoint
+        if (!same_peer(&from, &c->peer))
+            continue;
+
+        // check for ACK 1
+        if ((segment.flags & ETPT_ACK) == 0 || segment.ack != 1)
+            continue;
+
+        // If the SYN wasn't retransmitted, use its ACK as an RTT sample
+        if (retries == 0)
+        {
+            double sample = now_s() - first_sent_at;
+
+            c->smoothed_rtt = sample;
+            c->rtt_variation = sample / 2.0;
+            c->has_rtt_sample = 1;
+
+            c->retransmission_timeout =
+                c->smoothed_rtt + ETPT_K * c->rtt_variation;
+            if (c->retransmission_timeout < ETPT_MIN_RTO)
+                c->retransmission_timeout = ETPT_MIN_RTO;
+            if (c->retransmission_timeout > ETPT_MAX_RTO)
+                c->retransmission_timeout = ETPT_MAX_RTO;
+
+            c->st.rtt_samples++;
+            c->st.srtt_ms = c->smoothed_rtt * 1000.0;
+            c->st.rto_ms = c->retransmission_timeout * 1000.0;
+        }
+
+        // SYN is acknowledged, return the connection
+        c->send_base = 1;
+        return c;
+    }
 }
 
 int tp_send_all(tp_conn *c, const void *buf, size_t n)
