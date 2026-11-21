@@ -39,7 +39,7 @@ uint16_t etpt_checksum(const void *data, size_t n)
 size_t etpt_encode(uint8_t *out, uint8_t flags, uint32_t seq, uint32_t ack,
                    const void *payload, uint16_t len)
 {
-    if (len > ETPT_MAX_PAYLOAD || payload == NULL) {
+    if (len > ETPT_MAX_PAYLOAD || (len != 0 && payload == NULL) || out == NULL) {
         return 0;
     }
 
@@ -95,7 +95,7 @@ int etpt_decode(const uint8_t *dgram, size_t n, etpt_seg *seg)
     
     // Check length
     uint16_t length = (dgram[12] << 8) | dgram[13];
-    if (length > ETPT_MAX_PAYLOAD || n != ETPT_HEADER_SIZE + length) {
+    if (length > ETPT_MAX_PAYLOAD || n != (size_t)ETPT_HEADER_SIZE + length) {
         return ETPT_BADHDR;
     }
 
