@@ -141,9 +141,16 @@ void tp_set_window(int w)
 
 tp_listener *tp_listen(const char *bind_addr, uint16_t port)
 {
-    (void)bind_addr; (void)port;
-    /* TODO */
-    return NULL;
+    int fd = udp_open(bind_addr, port);
+    if (fd < 0)
+        return NULL;
+    tp_listener *l = calloc(1, sizeof *l);
+    if (l == NULL) {
+        close(fd);
+        return NULL;
+    }
+    l->fd = fd;
+    return l;
 }
 
 tp_conn *tp_accept(tp_listener *l, char *peer, size_t peerlen)
