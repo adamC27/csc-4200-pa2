@@ -51,11 +51,13 @@ static int udp_open(const char *addr, uint16_t port)
     a.sin_family = AF_INET;
     a.sin_port = htons(port);
     a.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (addr != NULL && inet_pton(AF_INET, addr, &a.sin_addr) != 1) {
+    if (addr != NULL && inet_pton(AF_INET, addr, &a.sin_addr) != 1)
+    {
         close(fd);
         return -1;
     }
-    if (bind(fd, (struct sockaddr *)&a, sizeof a) < 0) {
+    if (bind(fd, (struct sockaddr *)&a, sizeof a) < 0)
+    {
         close(fd);
         return -1;
     }
@@ -93,7 +95,8 @@ static ssize_t udp_recv(int fd, void *buf, size_t cap, double timeout_s, struct 
     FD_ZERO(&rs);
     FD_SET(fd, &rs);
     struct timeval tv, *tvp = NULL;
-    if (timeout_s >= 0) {
+    if (timeout_s >= 0)
+    {
         tv.tv_sec = (time_t)timeout_s;
         tv.tv_usec = (suseconds_t)((timeout_s - (double)tv.tv_sec) * 1e6);
         tvp = &tv;
@@ -118,16 +121,24 @@ static int same_peer(const struct sockaddr_in *a, const struct sockaddr_in *b)
 
 static int g_window = 8;
 
-struct tp_listener {
+struct tp_listener
+{
     int fd;
-    /* TODO: counters for datagrams rejected before a session exists */
+    unsigned long checksum_failures;
+    unsigned long invalid;
 };
 
-struct tp_conn {
+struct tp_conn
+{
     int fd;
     struct sockaddr_in peer;
     int owns_fd;
     tp_stats_t st;
+    uint32_t send_base;
+    uint32_t send_next;
+    uint32_t receive_next;
+    int window;
+    double retransmission_timeout;
     /* TODO: sending state (base, next, unacknowledged segments and their
      * send times, the timer, SRTT/RTTVAR/RTO, retries) and receiving state
      * (next expected, delivered bytes not yet read, peer FIN). */
@@ -145,7 +156,8 @@ tp_listener *tp_listen(const char *bind_addr, uint16_t port)
     if (fd < 0)
         return NULL;
     tp_listener *l = calloc(1, sizeof *l);
-    if (l == NULL) {
+    if (l == NULL)
+    {
         close(fd);
         return NULL;
     }
@@ -155,28 +167,117 @@ tp_listener *tp_listen(const char *bind_addr, uint16_t port)
 
 tp_conn *tp_accept(tp_listener *l, char *peer, size_t peerlen)
 {
-    (void)l; (void)peer; (void)peerlen;
-    /* TODO */
-    return NULL;
+    if (l == NULL)
+        return NULL;
+
+    uint8_t packet[65536];
+    struct sockaddr_in from;
+
+    while (1)
+    {
+        ssize_t n = udp_recv(l->fd, packet, sizeof packet, -1.0, &from);
+
+        // error
+        if (n < 0)
+            return NULL;
+        // timeout or interrupted
+        if (n == 0)
+            continue;
+
+        // make sure that the segment is valid and has a good checksum
+        etpt_seg segment;
+        int result = etpt_decode(packet, (size_t)n, &segment);
+
+        if (result == ETPT_BADSUM)
+        {
+            l->checksum_failures++;
+            continue;
+        }
+        if (result != ETPT_OK)
+        {
+            l->invalid++;
+            continue;
+        }
+
+        // keep only the known flags SYN, ACK, FIN and check if it's a SYN segment
+        uint8_t known_flags = segment.flags & (ETPT_SYN | ETPT_ACK | ETPT_FIN);
+
+        // if it's not a SYN segment, ignore it
+        if (known_flags != ETPT_SYN || segment.seq != 0 || segment.length != 0)
+            continue;
+
+        tp_conn *c = calloc(1, sizeof *c);
+        if (c == NULL)
+            return NULL;
+
+        c->fd = l->fd;
+        c->peer = from;
+        // The listener owns this socket, so the connection should not close it.
+        c->owns_fd = 0;
+
+        c->send_base = 1;
+        c->send_next = 1;
+        c->receive_next = 1;
+        c->window = g_window;
+        c->retransmission_timeout = ETPT_INIT_RTO;
+
+        // count the SYN
+        c->st.segments_received = 1;
+        c->st.checksum_failures = l->checksum_failures;
+        c->st.invalid = l->invalid;
+        c->st.rto_ms = ETPT_INIT_RTO * 1000.0;
+
+        if (peer != NULL && peerlen > 0)
+        {
+            char ip[INET_ADDRSTRLEN];
+            if (inet_ntop(AF_INET, &from.sin_addr, ip, sizeof ip) == NULL)
+            {
+                free(c);
+                return NULL;
+            }
+
+            // format the peer address and port into the buffer
+            snprintf(peer, peerlen, "%s:%u", ip, (unsigned)ntohs(from.sin_port));
+        }
+
+        // Send an ACK for the SYN segment
+        size_t ack_len = etpt_encode(packet, ETPT_ACK, c->send_next, c->receive_next, NULL, 0);
+        if (ack_len == 0)
+        {
+            free(c);
+            return NULL;
+        }
+
+        // Send the ACK segment to the peer
+        udp_send(c->fd, &c->peer, packet, ack_len);
+        c->st.acks_sent++;
+
+        return c;
+    }
 }
 
 tp_conn *tp_connect(const char *host, uint16_t port)
 {
-    (void)host; (void)port;
+    (void)host;
+    (void)port;
     /* TODO */
     return NULL;
 }
 
 int tp_send_all(tp_conn *c, const void *buf, size_t n)
 {
-    (void)c; (void)buf; (void)n;
+    (void)c;
+    (void)buf;
+    (void)n;
     /* TODO */
     return -1;
 }
 
 int tp_recv_exact(tp_conn *c, void *buf, size_t n)
 {
-    (void)c; (void)buf; (void)n;
+    (void)c;
+    (void)buf;
+    (void)n;
     /* TODO */
     return -1;
 }
@@ -210,6 +311,11 @@ void tp_close_listener(tp_listener *l)
 void etpt_unused_helpers_(void);
 void etpt_unused_helpers_(void)
 {
-    (void)now_s; (void)udp_open; (void)udp_resolve; (void)udp_send; (void)udp_recv;
-    (void)same_peer; (void)g_window;
+    (void)now_s;
+    (void)udp_open;
+    (void)udp_resolve;
+    (void)udp_send;
+    (void)udp_recv;
+    (void)same_peer;
+    (void)g_window;
 }
